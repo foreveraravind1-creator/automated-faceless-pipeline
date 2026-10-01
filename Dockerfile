@@ -34,6 +34,7 @@ COPY --from=builder /install /usr/local
 COPY agents/   agents/
 COPY core/     core/
 COPY webhook/  webhook/
+COPY niches/   niches/
 COPY main.py   .
 
 # Cloud Run writes to /tmp for ephemeral storage;

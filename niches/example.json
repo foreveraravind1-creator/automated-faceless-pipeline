@@ -1,0 +1,26 @@
+{
+  "name": "everyday-science",
+  "audience": "Curious adults scrolling short science videos who are not specialists",
+  "tone": "Warm, concrete, and plain-spoken. Wonder without hype.",
+  "language": "en",
+  "duration_seconds": 45,
+  "style": {
+    "do": [
+      "Open on a concrete image a viewer can picture",
+      "Explain one idea in everyday words",
+      "End with a reason to save or share"
+    ],
+    "dont": [
+      "No medical, legal, or financial advice",
+      "No fear-mongering or miracle claims",
+      "No jargon without a plain-language gloss"
+    ]
+  },
+  "hashtag_pool": [
+    "#science",
+    "#sciencefacts",
+    "#learnontiktok",
+    "#didyouknow",
+    "#everydayScience"
+  ]
+}

@@ -1,21 +1,22 @@
 ﻿# Automated Faceless Instagram Reels Pipeline
 
-A production-ready Python multi-agent system that generates and publishes
-60-second educational Instagram Reels from a single topic string.
-
-## Architecture
+A topic-in engine for faceless Instagram Reels. A niche is a JSON profile
+passed in with the topic. Pass 1 writes an unapproved script and stops.
 
 ```
-Topic --► Agent 1 --► Agent 2 --► Agent 3 --► Agent 4 --► Instagram
-         (Script)    (Media)     (Edit)      (Publish)
+Topic + niche JSON --► script stage (one Gemini Flash call) --► script.json
+                                                                 approved: false
 ```
 
-| Agent | Role | Model | Strategy |
-|-------|------|-------|----------|
-| 1 | Researcher & Writer | `claude-sonnet-4-5` (extended thinking) | LLM: script + JSON generation |
-| 2 | Media Synthesizer | `gemini-2.5-flash` + GCloud TTS + Pexels | LLM: query refinement only |
-| 3 | Editor | *(no LLM)* MoviePy / ffmpeg | Pure deterministic code |
-| 4 | Publisher | `gemini-2.5-flash` + GCS + Meta API | LLM: caption generation only |
+Later passes add local voice, Pexels + ffmpeg render, and a publish step that
+runs only when `approved` is true. The default command does not call them.
+
+| Stage | Role | Model | This pass |
+|-------|------|-------|-----------|
+| Script | Researcher & writer | `gemini-3.8-flash` (override with `GEMINI_MODEL`) | Runs. One structured JSON call. |
+| Media | Voice + stock footage | Later pass | Not run |
+| Editor | ffmpeg render | Later pass | Not run |
+| Publisher | Meta, only if approved | Later pass | Not run |
 
 ---
 
@@ -24,11 +25,9 @@ Topic --► Agent 1 --► Agent 2 --► Agent 3 --► Agent 4 --► Instagram
 ### 1. Prerequisites
 
 - Python 3.12+
-- `ffmpeg` installed and on PATH (`brew install ffmpeg` / `apt install ffmpeg`)
-- A GCP project with these APIs enabled:
-  - Cloud Text-to-Speech API
-  - Cloud Storage API
-  - IAM API (needed for V4 Signed URL generation with Workload Identity)
+- A Gemini API key (`GEMINI_API_KEY`)
+
+`ffmpeg`, Pexels, Cloud TTS, GCS, and Meta are not required for the script stage.
 
 ### 2. Install dependencies
 
@@ -43,15 +42,17 @@ cp .env.example .env
 # Edit .env with your real credentials
 ```
 
-### 4. Run the pipeline
+### 4. Run the script stage
 
 ```bash
-# Single run
-python main.py --topic "5 fascinating facts about black holes"
+# Writes output/<job_id>/script.json with "approved": false, then exits.
+python main.py --topic "Why is the sky blue?" --niche niches/example.json
 
-# With explicit job ID
-python main.py --topic "The science of sleep" --job-id sleep-001
+# With an explicit job id (must match ^[a-z0-9-]{1,32}$)
+python main.py --topic "The science of sleep" --niche niches/example.json --job-id sleep-001
 ```
+
+Only `GEMINI_API_KEY` is required. `--dry-run` and `--publish` are refused.
 
 ### 5. Start the webhook server
 
@@ -62,15 +63,10 @@ uvicorn webhook.server:app --reload --port 8080
 Trigger via webhook:
 
 ```bash
-# Asynchronous (RECOMMENDED for production - returns job_id immediately)
-curl -X POST http://localhost:8080/run-async \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "Why do we dream?"}'
-
-# Synchronous (testing only - blocks until pipeline completes)
+# Both routes only generate the script. Neither renders nor publishes.
 curl -X POST http://localhost:8080/run \
   -H "Content-Type: application/json" \
-  -d '{"topic": "Why do we dream?"}'
+  -d '{"topic": "Why do we dream?", "niche": "niches/example.json"}'
 ```
 
 ---
@@ -91,6 +87,9 @@ curl -X POST http://localhost:8080/run \
 >
 > - **Production trigger**: Always use `/run-async` or Cloud Tasks (see below).
 >   Never trigger `/run` synchronously from Cloud Scheduler at scale.
+>
+> Pass 1: both `/run` and `/run-async` only write an unapproved script.
+> They do not render, and they do not publish.
 
 ### 1. Build and push the container
 
@@ -104,13 +103,13 @@ gcloud builds submit --tag $IMAGE
 ### 2. Create Secret Manager secrets
 
 ```bash
-for SECRET in ANTHROPIC_API_KEY GOOGLE_API_KEY INSTAGRAM_ACCESS_TOKEN \
+for SECRET in GEMINI_API_KEY GOOGLE_API_KEY INSTAGRAM_ACCESS_TOKEN \
               INSTAGRAM_ACCOUNT_ID PEXELS_API_KEY; do
   gcloud secrets create $SECRET --replication-policy="automatic"
 done
 
-# Populate each secret
-echo -n "sk-ant-..." | gcloud secrets versions add ANTHROPIC_API_KEY --data-file=-
+# Populate each secret with your own values. Never commit them.
+echo -n "your-gemini-api-key" | gcloud secrets versions add GEMINI_API_KEY --data-file=-
 # Repeat for all others...
 ```
 
@@ -151,7 +150,7 @@ gcloud run deploy faceless-reels-pipeline \
   --timeout 900 \
   --concurrency 1 \
   --service-account $SA_EMAIL \
-  --set-secrets "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest,\
+  --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest,\
 GOOGLE_API_KEY=GOOGLE_API_KEY:latest,\
 INSTAGRAM_ACCESS_TOKEN=INSTAGRAM_ACCESS_TOKEN:latest,\
 INSTAGRAM_ACCOUNT_ID=INSTAGRAM_ACCOUNT_ID:latest,\
@@ -195,15 +194,13 @@ gcloud scheduler jobs create http faceless-reels-daily \
 
 ## Output Files
 
-Each run creates `output/{job_id}/`:
+The script stage creates `output/{job_id}/script.json` and stops.
+`approved` is always `false`. Media files are a later pass.
 
 ```
 output/
   abc12345/
-    script.json          # Agent 1: structured script payload
-    audio.mp3            # Agent 2: TTS narration (en-US-Journey-D)
-    background.mp4       # Agent 2: raw Pexels stock footage
-    final_reel.mp4       # Agent 3: finished 1080x1920, H.264/AAC, 30fps
+    script.json          # unapproved script (title, narration, pexels_query, caption, ...)
 ```
 
 On Cloud Run, `output/` is ephemeral. The reel is uploaded to GCS before
@@ -215,16 +212,17 @@ the container terminates; local files are discarded.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Liveness probe (no auth) |
-| `/run` | POST | Synchronous run (local testing only) |
-| `/run-async` | POST | Async dispatch — use this in production |
+| `/health` | GET | Liveness probe |
+| `/run` | POST | Generate one unapproved script and return |
+| `/run-async` | POST | Same script generation. Does not queue render or publish |
 
 ### Request body (both /run endpoints)
 
 ```json
 {
   "topic": "string (required)",
-  "job_id": "string (optional, auto-generated if omitted)"
+  "niche": "niches/example.json",
+  "job_id": "string (optional, must match ^[a-z0-9-]{1,32}$)"
 }
 ```
 
@@ -233,11 +231,44 @@ the container terminates; local files are discarded.
 ```json
 {
   "job_id": "abc12345",
-  "status": "completed | queued | error",
-  "instagram_post_id": "17854360229135492",
-  "gcs_url": "https://storage.googleapis.com/faceless-reels-public-assets/reels/...",
-  "message": "Pipeline completed successfully."
+  "status": "script_ready",
+  "approved": false,
+  "script_path": "output/abc12345/script.json",
+  "message": "Script written with approved=false. Nothing was rendered or published."
 }
+```
+
+## Niche profile
+
+`niches/example.json` is the checked-in example. Unknown keys are rejected.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | string | 1–80 characters |
+| `audience` | string | Who the reel is for |
+| `tone` | string | How it should sound |
+| `language` | string | Default `en` (`en`, `pt-BR`, …) |
+| `duration_seconds` | int | 15–90 |
+| `style.do` | string[] | What the script should do |
+| `style.dont` | string[] | What the script must not do |
+| `hashtag_pool` | string[] | Tags like `#science` |
+
+## script.json
+
+Gemini returns the first eight fields in one structured response. This process stamps the rest. `approved` is not in the model schema and is always `false`.
+
+| Field | Source |
+|-------|--------|
+| `title`, `hook`, `on_screen_hook`, `narration`, `pexels_query`, `caption`, `hashtags`, `claims_to_verify` | Gemini |
+| `approved` | Always `false` |
+| `topic`, `niche`, `language`, `duration_seconds` | Copied from the request and niche profile |
+
+`claims_to_verify` is the human fact-check list. The script is not retrieval-grounded.
+
+## Tests
+
+```bash
+python -m pytest tests/test_script_stage.py
 ```
 
 ---
