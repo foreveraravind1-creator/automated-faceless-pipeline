@@ -1,0 +1,39 @@
+﻿# .gitignore
+
+# Environment secrets - NEVER commit these
+.env
+.env.*
+*.json
+!package.json
+
+# Runtime output directory (ephemeral per-job artifacts)
+output/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# GCP service account key - NEVER commit
+*-key.json
+service-account*.json

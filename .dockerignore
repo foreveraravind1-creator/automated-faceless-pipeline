@@ -1,0 +1,15 @@
+﻿# .dockerignore
+.env
+.env.*
+output/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.git/
+.gitignore
+*.md
+tests/
+scratch/
