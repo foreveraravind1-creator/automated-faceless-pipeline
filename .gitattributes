@@ -1,0 +1,18 @@
+﻿# Normalize line endings: always LF in repo, OS-native on checkout
+* text=auto eol=lf
+
+# Force binary for compiled/media files
+*.mp3 binary
+*.mp4 binary
+*.png binary
+*.jpg binary
+
+# Explicitly text
+*.py text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
