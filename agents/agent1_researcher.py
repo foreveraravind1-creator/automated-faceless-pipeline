@@ -108,6 +108,8 @@ def run(state: JobState, client: Any | None = None) -> JobState:
         language=state.niche.language,
         duration_seconds=state.niche.duration_seconds,
     )
+    # The model cannot approve the script. Stamp false again at write time.
+    script.approved = False
 
     output_dir: Path = settings.output_dir / state.job_id
     output_dir.mkdir(parents=True, exist_ok=True)

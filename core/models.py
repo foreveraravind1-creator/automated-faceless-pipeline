@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 import uuid
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -143,10 +143,11 @@ class ScriptPayload(ScriptDraft):
 
     Model fields come from ScriptDraft. topic, niche, language, and
     duration_seconds are copied from the request so later stages can run
-    from this file alone. approved is always false in this pass.
+    from this file alone. The writer stamps approved false. A reviewer
+    can set it true in script.json and load that file.
     """
 
-    approved: Literal[False] = False
+    approved: bool = False
     topic: str = Field(..., min_length=1)
     niche: str = Field(..., min_length=1)
     language: str = Field(..., min_length=2)

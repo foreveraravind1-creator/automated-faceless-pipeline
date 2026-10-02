@@ -140,6 +140,56 @@ def test_script_stage_one_call_and_unapproved(tmp_path: Path, fake_client: FakeC
     assert state.script.approved is False
 
 
+def _saved_script(**overrides) -> dict:
+    payload = {
+        **SAMPLE,
+        "topic": "Why is the sky blue?",
+        "niche": "everyday-science",
+        "language": "en",
+        "duration_seconds": 45,
+        "approved": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_script_json_approved_true_loads(tmp_path: Path):
+    path = tmp_path / "script.json"
+    path.write_text(json.dumps(_saved_script(approved=True)), encoding="utf-8")
+    loaded = ScriptPayload.model_validate_json(path.read_text(encoding="utf-8"))
+    assert loaded.approved is True
+
+
+def test_writer_stamps_false_when_model_returns_approved_true(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "output_dir", tmp_path)
+    client = FakeClient()
+    client.models.generate_content = _returning_approved_true(client.models)
+
+    state = run_script(
+        topic="Why is the sky blue?",
+        niche_path=NICHE,
+        job_id="sky-true",
+        client=client,
+    )
+
+    assert len(client.models.calls) == 1
+    assert "approved" not in client.models.calls[0]["config"]["response_json_schema"]["properties"]
+    saved = json.loads((tmp_path / "sky-true" / "script.json").read_text(encoding="utf-8"))
+    assert saved["approved"] is False
+    assert state.script is not None
+    assert state.script.approved is False
+
+
+def _returning_approved_true(models: FakeModels):
+    def generate_content(**kwargs):
+        models.calls.append(kwargs)
+        return _Response(json.dumps({**SAMPLE, "approved": True}))
+
+    return generate_content
+
+
 def test_missing_gemini_key_raises_before_network(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "output_dir", tmp_path)
     monkeypatch.setattr(settings, "gemini_api_key", "")
