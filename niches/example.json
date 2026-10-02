@@ -4,6 +4,8 @@
   "tone": "Warm, concrete, and plain-spoken. Wonder without hype.",
   "language": "en",
   "duration_seconds": 45,
+  "voice": "af_heart",
+  "kokoro_lang": "a",
   "style": {
     "do": [
       "Open on a concrete image a viewer can picture",

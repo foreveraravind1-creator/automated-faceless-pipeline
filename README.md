@@ -1,22 +1,21 @@
 ﻿# Automated Faceless Instagram Reels Pipeline
 
 A topic-in engine for faceless Instagram Reels. A niche is a JSON profile
-passed in with the topic. Pass 1 writes an unapproved script and stops.
+passed in with the topic. The default command writes an unapproved script
+and stops. `--dry-run` renders only after a person sets `approved` to true.
+It does not upload or publish.
 
 ```
-Topic + niche JSON --► script stage (one Gemini Flash call) --► script.json
-                                                                 approved: false
+Topic + niche JSON --► one Gemini Flash call --► script.json (approved: false)
+approved script.json --► Kokoro-82M + Pexels + ffmpeg --► final_reel.mp4
 ```
 
-Later passes add local voice, Pexels + ffmpeg render, and a publish step that
-runs only when `approved` is true. The default command does not call them.
-
-| Stage | Role | Model | This pass |
-|-------|------|-------|-----------|
-| Script | Researcher & writer | `gemini-3.8-flash` (override with `GEMINI_MODEL`) | Runs. One structured JSON call. |
-| Media | Voice + stock footage | Later pass | Not run |
-| Editor | ffmpeg render | Later pass | Not run |
-| Publisher | Meta, only if approved | Later pass | Not run |
+| Stage | Role | When it runs |
+|-------|------|----------------|
+| Script | One Gemini Flash call | `python main.py --topic ... --niche ...` |
+| Voice + picture | Local Kokoro-82M and Pexels | `--dry-run`, and only if `approved` is true |
+| Render | ffmpeg, 1080x1920 H.264/AAC | same `--dry-run` |
+| Publish | Meta | Not implemented. `--publish` is refused. |
 
 ---
 
@@ -24,10 +23,11 @@ runs only when `approved` is true. The default command does not call them.
 
 ### 1. Prerequisites
 
-- Python 3.12+
-- A Gemini API key (`GEMINI_API_KEY`)
-
-`ffmpeg`, Pexels, Cloud TTS, GCS, and Meta are not required for the script stage.
+- Python 3.12. Kokoro-82M does not run on Python 3.13 or newer, so the
+  Dockerfile stays on `python:3.12-slim`.
+- A Gemini API key (`GEMINI_API_KEY`) for the script command
+- For `--dry-run`: `ffmpeg`, `espeak-ng`, a DejaVu font (`fonts-dejavu-core`),
+  and `PEXELS_API_KEY`. The first Kokoro run downloads weights from Hugging Face.
 
 ### 2. Install dependencies
 
@@ -52,7 +52,25 @@ python main.py --topic "Why is the sky blue?" --niche niches/example.json
 python main.py --topic "The science of sleep" --niche niches/example.json --job-id sleep-001
 ```
 
-Only `GEMINI_API_KEY` is required. `--dry-run` and `--publish` are refused.
+Only `GEMINI_API_KEY` is required for that command. `--publish` is refused.
+
+### 4b. Render an approved script
+
+Edit `output/<job_id>/script.json` and set `"approved": true` after review.
+Then:
+
+```bash
+python main.py --dry-run --job-id sleep-001
+# same thing:
+python main.py --dry-run sleep-001
+```
+
+If `approved` is false, the command refuses and does not download or encode.
+The reel is `output/<job_id>/final_reel.mp4` (or `$OUTPUT_DIR/<job_id>/`).
+Kokoro writes `audio.wav` and `timings.json`. ffmpeg burns `on_screen_hook`
+for the first 3 seconds and narration captions from those timings.
+`h264_nvenc` is used only if a one-frame test encode succeeds; otherwise
+`libx264`. Nothing is uploaded.
 
 ### 5. Start the webhook server
 
@@ -115,21 +133,17 @@ echo -n "your-gemini-api-key" | gcloud secrets versions add GEMINI_API_KEY --dat
 
 ### 3. Grant IAM roles for Workload Identity + Signed URL signing
 
-The Cloud Run service account needs two specific roles to generate V4 Signed URLs
+The Cloud Run service account needs these roles to generate V4 Signed URLs
 without a service-account key file:
 
 ```bash
 PROJECT_ID=your-gcp-project-id
 SA_EMAIL=your-cloudrun-sa@$PROJECT_ID.iam.gserviceaccount.com
 
-# Allow GCS and TTS access
+# Allow GCS access for a later publish pass. Voice is local Kokoro, not Cloud TTS.
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:$SA_EMAIL" \
   --role="roles/storage.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:$SA_EMAIL" \
-  --role="roles/cloudtexttospeech.user"
 
 # Allow the SA to sign blobs (needed for V4 Signed URLs on Cloud Run)
 # The SA grants this role TO ITSELF - this is the standard pattern.
@@ -194,14 +208,22 @@ gcloud scheduler jobs create http faceless-reels-daily \
 
 ## Output Files
 
-The script stage creates `output/{job_id}/script.json` and stops.
-`approved` is always `false`. Media files are a later pass.
+The script command creates `output/{job_id}/script.json` with `"approved": false`.
+`--dry-run` adds the media files only after that flag is set to true.
 
 ```
 output/
   abc12345/
-    script.json          # unapproved script (title, narration, pexels_query, caption, ...)
+    script.json          # title, narration, pexels_query, caption, approved, ...
+    audio.wav            # Kokoro narration (--dry-run)
+    timings.json         # word or chunk timings (--dry-run)
+    background.mp4       # Pexels clip (--dry-run)
+    captions.ass         # burned-in narration cues (--dry-run)
+    final_reel.mp4       # 1080x1920 H.264/AAC (--dry-run)
 ```
+
+`OUTPUT_DIR` overrides the directory. The container sets it to `/tmp/output`
+so the non-root user can write it.
 
 On Cloud Run, `output/` is ephemeral. The reel is uploaded to GCS before
 the container terminates; local files are discarded.
@@ -248,27 +270,29 @@ the container terminates; local files are discarded.
 | `audience` | string | Who the reel is for |
 | `tone` | string | How it should sound |
 | `language` | string | Default `en` (`en`, `pt-BR`, …) |
-| `duration_seconds` | int | 15–90 |
+| `duration_seconds` | int | 15–90. Render fails if audio exceeds this plus 5s, and never allows more than 90s. |
+| `voice` | string | Optional Kokoro voice. Default `af_heart`. |
+| `kokoro_lang` | string | Optional Kokoro lang code. Default `a` (American English). |
 | `style.do` | string[] | What the script should do |
 | `style.dont` | string[] | What the script must not do |
 | `hashtag_pool` | string[] | Tags like `#science` |
 
 ## script.json
 
-Gemini returns the first eight fields in one structured response. This process stamps the rest. `approved` is not in the model schema and is always `false`.
+Gemini returns the first eight fields in one structured response. This process stamps the rest. `approved` is not in the model schema. The writer always saves `false`; a reviewer can set `true` and the file still loads.
 
 | Field | Source |
 |-------|--------|
 | `title`, `hook`, `on_screen_hook`, `narration`, `pexels_query`, `caption`, `hashtags`, `claims_to_verify` | Gemini |
-| `approved` | Always `false` |
-| `topic`, `niche`, `language`, `duration_seconds` | Copied from the request and niche profile |
+| `approved` | Writer saves `false`. Reviewer may set `true`. |
+| `topic`, `niche`, `language`, `duration_seconds`, `voice`, `kokoro_lang` | Copied from the request, niche, and Kokoro settings |
 
 `claims_to_verify` is the human fact-check list. The script is not retrieval-grounded.
 
 ## Tests
 
 ```bash
-python -m pytest tests/test_script_stage.py
+python -m pytest tests
 ```
 
 ---

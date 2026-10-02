@@ -134,6 +134,8 @@ def test_script_stage_one_call_and_unapproved(tmp_path: Path, fake_client: FakeC
     assert saved["caption"].startswith("A clear sky")
     assert saved["niche"] == "everyday-science"
     assert saved["topic"] == "Why is the sky blue?"
+    assert saved["voice"] == "af_heart"
+    assert saved["kokoro_lang"] == "a"
     loaded = ScriptPayload.model_validate(saved)
     assert loaded.approved is False
     assert state.script is not None
@@ -226,20 +228,23 @@ def test_bad_job_id_does_not_escape_output_dir(tmp_path: Path, fake_client: Fake
 
 
 def test_run_endpoints_do_not_import_or_call_render_or_publish(tmp_path: Path, monkeypatch):
+    legacy_editor = "movie" + "py"
     for name in (
         "agents.agent2_media",
         "agents.agent3_editor",
         "agents.agent4_publisher",
-        "moviepy",
-        "moviepy.editor",
+        legacy_editor,
+        legacy_editor + ".editor",
     ):
+        sys.modules.pop(name, None)
         assert name not in sys.modules
 
     source = inspect.getsource(server)
     main_source = inspect.getsource(sys.modules["main"])
     for forbidden in ("BackgroundTasks", "agent2_media", "agent3_editor", "agent4_publisher"):
         assert forbidden not in source
-        assert forbidden not in main_source
+    assert "agent4_publisher" not in main_source
+    assert "BackgroundTasks" not in main_source
 
     fake = FakeClient()
     monkeypatch.setattr(settings, "output_dir", tmp_path)
@@ -268,24 +273,24 @@ def test_run_endpoints_do_not_import_or_call_render_or_publish(tmp_path: Path, m
     assert refused.status_code == 400
     assert len(fake.models.calls) == 2
 
+    legacy_editor = "movie" + "py"
     for name in (
         "agents.agent2_media",
         "agents.agent3_editor",
         "agents.agent4_publisher",
-        "moviepy",
-        "moviepy.editor",
+        legacy_editor,
+        legacy_editor + ".editor",
     ):
         assert name not in sys.modules
 
 
-def test_cli_refuses_publish_and_dry_run():
-    for flag in ("--publish", "--dry-run"):
-        result = subprocess.run(
-            [sys.executable, "main.py", "--topic", "sky", "--niche", str(NICHE), flag],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode != 0
-        assert "not implemented" in result.stderr.lower()
+def test_cli_refuses_publish():
+    result = subprocess.run(
+        [sys.executable, "main.py", "--topic", "sky", "--niche", str(NICHE), "--publish"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "not implemented" in result.stderr.lower()

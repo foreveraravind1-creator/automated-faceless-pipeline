@@ -2,24 +2,23 @@
 # requirements.txt
 # Automated Faceless Instagram Reels Pipeline
 # Target: Google Cloud Run (Python 3.12, linux/amd64)
+# Kokoro-82M requires Python < 3.13. Do not move this image to 3.13.
 # ============================================================
 
 # ── AI / LLM ─────────────────────────────────────────────────
-google-genai>=2.26.0               # Script stage: Gemini Flash structured JSON
-google-generativeai>=0.8.3         # Later media/publish code (not on the script path)
+google-genai>=2.26.0               # Script stage: one Gemini Flash structured call
+
+# ── Local voice (dry-run only) ───────────────────────────────
+kokoro>=0.9.4                      # Kokoro-82M TTS. Needs espeak-ng and Python <3.13.
+soundfile>=0.12.1                  # Write narration wav files
 
 # ── Google Cloud ─────────────────────────────────────────────
-google-cloud-texttospeech>=2.17.0  # Agent 2: en-US-Journey-D TTS
-google-cloud-storage>=2.18.0       # Agent 4: GCS upload + V4 Signed URL generation
+google-cloud-storage>=2.18.0       # Later publish pass: GCS upload (not called yet)
 # google-auth is pinned explicitly because Agent 4 uses google.auth.default()
 # to detect credential type (service-account key vs Workload Identity) for
 # V4 Signed URL signing strategy selection.
 google-auth>=2.35.0
 google-auth-httplib2>=0.2.0        # Required by google-auth transport layer
-
-# ── Video processing ─────────────────────────────────────────
-moviepy>=1.0.3                     # Agent 3: video assembly (pure deterministic)
-imageio[ffmpeg]>=2.35.0            # MoviePy ffmpeg backend
 
 # ── HTTP client ──────────────────────────────────────────────
 httpx>=0.27.0                      # Pexels API + Meta Graph API

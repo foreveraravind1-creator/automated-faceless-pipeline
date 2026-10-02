@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # job_id is used as a single path segment under output/.
@@ -56,6 +56,9 @@ class NicheProfile(BaseModel):
     duration_seconds: int = Field(..., ge=15, le=90)
     style: NicheStyle = Field(default_factory=NicheStyle)
     hashtag_pool: list[str] = Field(..., min_length=1)
+    # Empty means "use KOKORO_VOICE / KOKORO_LANG" when the script is written.
+    voice: str = ""
+    kokoro_lang: str = ""
 
     @field_validator("language")
     @classmethod
@@ -75,6 +78,22 @@ class NicheProfile(BaseModel):
                 cleaned.append(normalized)
         if not cleaned:
             raise ValueError("hashtag_pool must contain at least one hashtag")
+        return cleaned
+
+    @field_validator("voice")
+    @classmethod
+    def _voice(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and re.fullmatch(r"[A-Za-z0-9_]+", cleaned) is None:
+            raise ValueError("voice must look like af_heart")
+        return cleaned
+
+    @field_validator("kokoro_lang")
+    @classmethod
+    def _kokoro_lang(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned and re.fullmatch(r"[a-z0-9-]{1,8}", cleaned) is None:
+            raise ValueError("kokoro_lang must be a Kokoro code such as 'a'")
         return cleaned
 
 
@@ -152,11 +171,48 @@ class ScriptPayload(ScriptDraft):
     niche: str = Field(..., min_length=1)
     language: str = Field(..., min_length=2)
     duration_seconds: int = Field(..., ge=15, le=90)
+    voice: str = "af_heart"
+    kokoro_lang: str = "a"
+
+    @field_validator("voice")
+    @classmethod
+    def _voice(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and re.fullmatch(r"[A-Za-z0-9_]+", cleaned) is None:
+            raise ValueError("voice must look like af_heart")
+        return cleaned or "af_heart"
+
+    @field_validator("kokoro_lang")
+    @classmethod
+    def _kokoro_lang(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned and re.fullmatch(r"[a-z0-9-]{1,8}", cleaned) is None:
+            raise ValueError("kokoro_lang must be a Kokoro code such as 'a'")
+        return cleaned or "a"
 
     @property
     def visual_prompt(self) -> str:
         """Alias kept so untouched media code can still read a search query."""
         return self.pexels_query
+
+
+class CaptionCue(BaseModel):
+    """One burned-in caption span, timed from the speech track."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1)
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+
+    @model_validator(mode="after")
+    def _span(self) -> "CaptionCue":
+        self.text = self.text.strip()
+        if not self.text:
+            raise ValueError("caption cue text is empty")
+        if self.end <= self.start:
+            raise ValueError("caption cue end must be after start")
+        return self
 
 
 class JobState(BaseModel):
@@ -172,9 +228,11 @@ class JobState(BaseModel):
     # Populated by the script stage
     script: Optional[ScriptPayload] = None
 
-    # Populated by later passes (not run in pass 1)
+    # Populated by --dry-run (voice, stock footage, ffmpeg). Not by the script command.
     audio_path: Optional[Path] = None
+    audio_duration: Optional[float] = None
     background_path: Optional[Path] = None
+    caption_cues: list[CaptionCue] = Field(default_factory=list)
     final_reel_path: Optional[Path] = None
     gcs_public_url: Optional[str] = None
     instagram_post_id: Optional[str] = None

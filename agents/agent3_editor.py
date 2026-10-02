@@ -1,135 +1,274 @@
 ﻿"""
 agents/agent3_editor.py
-Agent 3 - Editor
-Tool: MoviePy 1.x + ffmpeg (100% deterministic - no LLM calls)
+ffmpeg render. No model call.
 
-Rationale: video assembly (resize, crop, loop, mux) is pure algorithmic work.
-Routing it through an LLM adds latency, token cost, and a failure surface with
-zero benefit - the logic is fixed regardless of what a model says.
-
-Input  : JobState.audio_path, JobState.background_path
-Output : JobState.final_reel_path (final_reel.mp4, 1080x1920, H.264/AAC, 30fps)
+Burns script.on_screen_hook for the first 3 seconds and narration captions
+timed from the speech track. Output is 1080x1920 H.264 + AAC.
 """
+from __future__ import annotations
+
+import shutil
+import subprocess
 from pathlib import Path
+from typing import Callable
 
-from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
-
-from core.config import settings
 from core.logger import get_logger
-from core.models import JobState
+from core.models import CaptionCue, JobState
+from core.timing import assert_audio_within_cap
 
 logger = get_logger(__name__)
 
-TARGET_W = 1080
-TARGET_H = 1920
-TARGET_RATIO = TARGET_W / TARGET_H  # 0.5625  (9:16 portrait)
+WIDTH = 1080
+HEIGHT = 1920
+HOOK_SECONDS = 3.0
+_ENCODER: str | None = None
+
+_FONT_CANDIDATES = (
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+def run(
+    state: JobState,
+    *,
+    run_ffmpeg: Callable[[list[str]], None] | None = None,
+    encoder: str | None = None,
+    fontfile: Path | None = None,
+) -> JobState:
+    """Mux the background and narration into final_reel.mp4."""
+    if state.script is None:
+        raise ValueError("a script is required")
+    if state.audio_path is None or state.background_path is None:
+        raise ValueError("audio and background video are required")
+    if state.audio_duration is None:
+        raise ValueError("audio duration is required")
 
-def _crop_to_916(source_path: Path) -> VideoFileClip:
-    """
-    Load a video and resize+center-crop it to exactly TARGET_W x TARGET_H.
-    Opens a fresh VideoFileClip each call to avoid reader conflicts when
-    the same source file is concatenated multiple times for looping.
-    """
-    clip = VideoFileClip(str(source_path), audio=False)
-    src_ratio = clip.w / clip.h
+    assert_audio_within_cap(state.audio_duration, state.script.duration_seconds)
+    font = fontfile or find_font()
+    job_dir = state.audio_path.parent
+    ass_path = job_dir / "captions.ass"
+    hook_path = job_dir / "hook.txt"
+    output_path = job_dir / "final_reel.mp4"
+    cues = state.caption_cues
+    write_ass(ass_path, cues)
+    hook_path.write_text(_one_line(state.script.on_screen_hook), encoding="utf-8")
 
-    if src_ratio > TARGET_RATIO:
-        # Source is wider than 9:16 -> scale by height, crop excess width
-        clip = clip.resize(height=TARGET_H)
-        x_c = clip.w / 2
-        clip = clip.crop(x1=x_c - TARGET_W / 2, x2=x_c + TARGET_W / 2)
-    else:
-        # Source is taller or equal -> scale by width, crop excess height
-        clip = clip.resize(width=TARGET_W)
-        y_c = clip.h / 2
-        clip = clip.crop(y1=y_c - TARGET_H / 2, y2=y_c + TARGET_H / 2)
-
-    # Guard against sub-pixel rounding errors producing wrong dimensions
-    if (clip.w, clip.h) != (TARGET_W, TARGET_H):
-        clip = clip.resize((TARGET_W, TARGET_H))
-
-    return clip
-
-
-def _build_background_clip(video_path: Path, target_duration: float) -> VideoFileClip:
-    """
-    Produce a 9:16 background clip of exactly target_duration seconds.
-    If the source is shorter than target_duration, it is looped.
-    Each loop segment opens the source file independently to avoid
-    MoviePy reader-state conflicts on the same underlying file handle.
-    """
-    # Probe duration without keeping a reader open
-    probe = VideoFileClip(str(video_path), audio=False)
-    source_duration = probe.duration
-    probe.close()
-
-    if source_duration >= target_duration:
-        clip = _crop_to_916(video_path)
-        return clip.subclip(0, target_duration)
-
-    # Source is shorter than audio: calculate needed loops then concatenate
-    n_loops = int(target_duration / source_duration) + 1
+    chosen = encoder or select_encoder()
+    command = build_ffmpeg_command(
+        background=state.background_path,
+        audio=state.audio_path,
+        output=output_path,
+        ass_path=ass_path,
+        hook_path=hook_path,
+        fontfile=font,
+        encoder=chosen,
+        audio_duration=state.audio_duration,
+    )
     logger.info(
-        "Background shorter than audio - looping",
-        extra={"source_s": round(source_duration, 2), "loops_needed": n_loops},
+        "Rendering reel",
+        extra={"job_id": state.job_id, "encoder": chosen, "duration_s": round(state.audio_duration, 2)},
     )
-    segments = [_crop_to_916(video_path) for _ in range(n_loops)]
-    looped = concatenate_videoclips(segments, method="compose")
-    return looped.subclip(0, target_duration)
-
-
-# ---------------------------------------------------------------------------
-# Agent entry-point
-# ---------------------------------------------------------------------------
-
-def run(state: JobState) -> JobState:
-    """Run Agent 3 and populate state.final_reel_path."""
-    logger.info("Agent 3 starting", extra={"job_id": state.job_id})
-
-    output_dir: Path = settings.output_dir / state.job_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-    final_path = output_dir / "final_reel.mp4"
-
-    # Load audio to determine the exact target duration
-    audio = AudioFileClip(str(state.audio_path))
-    audio_duration = audio.duration
-    logger.info("Audio loaded", extra={"duration_s": round(audio_duration, 2)})
-
-    # Build 9:16 background - looped/trimmed to match audio exactly
-    bg = _build_background_clip(state.background_path, audio_duration)
-
-    # Attach TTS audio and lock clip duration to audio length
-    final = bg.set_audio(audio).set_duration(audio_duration)
-
-    # Export: H.264 + AAC, 30fps, CRF 23, yuv420p for broad device compatibility
-    logger.info("Exporting final_reel.mp4", extra={"job_id": state.job_id})
-    final.write_videofile(
-        str(final_path),
-        fps=30,
-        codec="libx264",
-        audio_codec="aac",
-        preset="fast",
-        ffmpeg_params=["-crf", "23", "-pix_fmt", "yuv420p"],
-        logger=None,   # suppress MoviePy's verbose ffmpeg progress output
-    )
-
-    # Release all file handles to free memory on Cloud Run
-    audio.close()
-    bg.close()
-    final.close()
-
-    state.final_reel_path = final_path
-    logger.info(
-        "Agent 3 complete",
-        extra={
-            "job_id": state.job_id,
-            "output": str(final_path),
-            "duration_s": round(audio_duration, 2),
-        },
-    )
+    (run_ffmpeg or _run_ffmpeg)(command)
+    state.final_reel_path = output_path
+    logger.info("Render complete", extra={"job_id": state.job_id, "output": str(output_path)})
     return state
+
+
+def build_ffmpeg_command(
+    *,
+    background: Path,
+    audio: Path,
+    output: Path,
+    ass_path: Path,
+    hook_path: Path,
+    fontfile: Path,
+    encoder: str,
+    audio_duration: float,
+) -> list[str]:
+    """
+    Loop and cover-crop the background to 1080x1920, trim it to the audio,
+    and burn captions plus the hook overlay.
+
+    Template (encoder is libx264 or h264_nvenc):
+
+        ffmpeg -y -stream_loop -1 -i BACKGROUND -i AUDIO -t DURATION
+          -map 0:v:0 -map 1:a:0
+          -vf scale=1080x1920:force_original_aspect_ratio=increase,crop=1080:1920,
+              subtitles=CAPTIONS,drawtext=fontfile=FONT:textfile=HOOK:enable='lt(t,3)'
+          -r 30 -c:v ENCODER -pix_fmt yuv420p -c:a aac -movflags +faststart
+          OUTPUT
+    """
+    fontsdir = fontfile.parent
+    video_filter = ",".join(
+        [
+            f"scale={WIDTH}x{HEIGHT}:force_original_aspect_ratio=increase",
+            f"crop={WIDTH}:{HEIGHT}",
+            "subtitles={}:fontsdir={}".format(
+                _escape_filter(ass_path),
+                _escape_filter(fontsdir),
+            ),
+            "drawtext=fontfile={}:textfile={}:fontsize=64:fontcolor=white:"
+            "borderw=4:bordercolor=black:x=(w-text_w)/2:y=160:enable='lt(t,{})'".format(
+                _escape_filter(fontfile),
+                _escape_filter(hook_path),
+                int(HOOK_SECONDS) if HOOK_SECONDS == int(HOOK_SECONDS) else HOOK_SECONDS,
+            ),
+        ]
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(background),
+        "-i",
+        str(audio),
+        "-t",
+        f"{audio_duration:.3f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-vf",
+        video_filter,
+        "-r",
+        "30",
+        "-c:v",
+        encoder,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if encoder == "libx264":
+        command.extend(["-preset", "veryfast", "-crf", "23"])
+    else:
+        command.extend(["-preset", "p4", "-rc", "vbr", "-cq", "23"])
+    command.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+    )
+    return command
+
+
+def select_encoder(runner: Callable[..., subprocess.CompletedProcess] | None = None) -> str:
+    """Use h264_nvenc only after a one-frame test encode succeeds."""
+    global _ENCODER
+    if runner is None and _ENCODER is not None:
+        return _ENCODER
+    chosen = "h264_nvenc" if nvenc_works(runner or subprocess.run) else "libx264"
+    if runner is None:
+        _ENCODER = chosen
+        logger.info("Video encoder selected", extra={"encoder": chosen})
+    return chosen
+
+
+def nvenc_works(runner: Callable[..., subprocess.CompletedProcess]) -> bool:
+    """Tiny encode. Listing encoders is not enough; the device has to encode."""
+    if shutil.which("ffmpeg") is None and runner is subprocess.run:
+        return False
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:d=0.1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = runner(command, capture_output=True, check=False)
+    except (OSError, FileNotFoundError):
+        return False
+    return result.returncode == 0
+
+
+def find_font() -> Path:
+    for path in _FONT_CANDIDATES:
+        if path.is_file():
+            return path
+    raise RuntimeError(
+        "No caption font found. Install fonts-dejavu-core "
+        "(DejaVuSans-Bold.ttf) or liberation fonts."
+    )
+
+
+def write_ass(path: Path, cues: list[CaptionCue]) -> None:
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {WIDTH}",
+        f"PlayResY: {HEIGHT}",
+        "WrapStyle: 0",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Caption,DejaVu Sans,58,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        "-1,0,0,0,100,100,0,0,1,4,0,2,70,70,280,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for cue in cues:
+        lines.append(
+            f"Dialogue: 0,{_ass_time(cue.start)},{_ass_time(cue.end)},Caption,,0,0,0,,"
+            f"{_ass_text(cue.text)}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_ffmpeg(command: list[str]) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg failed ({result.returncode}): {detail[-2000:]}")
+
+
+def _escape_filter(path: Path) -> str:
+    text = path.resolve().as_posix()
+    return (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
+
+def _ass_time(seconds: float) -> str:
+    centiseconds = max(0, int(round(seconds * 100)))
+    hours, centiseconds = divmod(centiseconds, 360_000)
+    minutes, centiseconds = divmod(centiseconds, 6_000)
+    secs, centiseconds = divmod(centiseconds, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+
+
+def _ass_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())

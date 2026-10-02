@@ -1,8 +1,10 @@
 ﻿"""
 agents/agent4_publisher.py
 Agent 4 - Publisher
-Model: gemini-2.5-flash  -  used ONLY for caption generation (legitimate LLM work)
 APIs : Google Cloud Storage (V4 Signed URL), Meta Graph API v20.0
+
+The Instagram caption is script.caption. This module does not call a model.
+Nothing in the script or dry-run commands imports or calls it.
 
 GCS strategy: V4 Signed URL (30-minute TTL)
   - Works under Uniform Bucket-Level Access (UBLA) - no object ACLs needed.
@@ -23,7 +25,6 @@ from pathlib import Path
 
 import google.auth
 import google.auth.transport.requests
-import google.generativeai as genai
 import httpx
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import storage
@@ -218,31 +219,13 @@ def _publish_reel(container_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run(state: JobState) -> JobState:
-    """Run Agent 4: generate caption, upload to GCS, publish to Instagram."""
+    """Upload and publish using the caption already stored on the script."""
     logger.info("Agent 4 starting", extra={"job_id": state.job_id})
+    if state.script is None:
+        raise ValueError("a script is required")
 
-    # Caption generation is a legitimate LLM task - Gemini drafts a polished
-    # Instagram caption with hashtags from the script context.
-    genai.configure(api_key=settings.google_api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
-    caption_resp = model.generate_content(
-        f"""Write an Instagram Reel caption for this educational short video.
-
-Title    : {state.script.title}
-Hook     : {state.script.hook}
-Narration: {state.script.narration[:300]}...
-
-Requirements:
-- Maximum 2200 characters total
-- Do NOT start the first line with an emoji (harms algorithmic reach)
-- Second line onwards: conversational, warm, curiosity-driven tone
-- Include a clear call-to-action (e.g. "Follow for more", "Save this for later")
-- End with 6-8 tightly relevant hashtags on their own line
-- Return ONLY the caption text, no preamble or explanation"""
-    )
-    caption = caption_resp.text.strip()
-    logger.info("Caption generated", extra={"length": len(caption)})
+    caption = state.script.caption
+    logger.info("Using script caption", extra={"length": len(caption)})
 
     # Upload reel to GCS, get a 30-minute V4 Signed URL (UBLA-compatible)
     signed_url = _upload_to_gcs_signed(state.final_reel_path)

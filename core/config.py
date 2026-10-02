@@ -37,8 +37,12 @@ class Settings(BaseSettings):
     instagram_access_token: str = ""
     instagram_account_id: str = ""
 
-    # Pexels Stock Video (later media pass)
+    # Pexels stock video. Required only for --dry-run.
     pexels_api_key: str = ""
+
+    # Local Kokoro-82M voice. Niche voice / kokoro_lang override these.
+    kokoro_voice: str = "af_heart"
+    kokoro_lang: str = "a"
 
     # Runtime
     output_dir: Path = Path("output")

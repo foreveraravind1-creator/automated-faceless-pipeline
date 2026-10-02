@@ -107,6 +107,8 @@ def run(state: JobState, client: Any | None = None) -> JobState:
         niche=state.niche.name,
         language=state.niche.language,
         duration_seconds=state.niche.duration_seconds,
+        voice=state.niche.voice or settings.kokoro_voice or "af_heart",
+        kokoro_lang=state.niche.kokoro_lang or settings.kokoro_lang or "a",
     )
     # The model cannot approve the script. Stamp false again at write time.
     script.approved = False
