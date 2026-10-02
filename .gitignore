@@ -3,8 +3,10 @@
 # Environment secrets - NEVER commit these
 .env
 .env.*
+!.env.example
 *.json
 !package.json
+!niches/*.json
 
 # Runtime output directory (ephemeral per-job artifacts)
 output/

@@ -1,103 +1,205 @@
 ﻿"""
 main.py
-Orchestrator - sequential multi-agent pipeline.
 
-Usage:
-    python main.py --topic "5 facts about black holes"
-    python main.py --topic "The science of sleep" --job-id my-test-01
+Script command (default):
+    python main.py --topic "Why is the sky blue?" --niche niches/example.json
+    python main.py --topic "The science of sleep" --niche niches/example.json --job-id sleep-001
+
+    Writes output/<job_id>/script.json with approved=false and exits.
+    It does not render or publish.
+
+Dry run (render only an already approved script):
+    python main.py --dry-run --job-id sleep-001
+    python main.py --dry-run sleep-001
+
+    Loads output/<job_id>/script.json. Renders only when approved is true.
+    Does not upload or publish.
+
+--publish is refused. It is reserved for a later pass.
 """
 import argparse
-import uuid
+import sys
 from pathlib import Path
 
-from agents import agent1_researcher, agent2_media, agent3_editor, agent4_publisher
+from pydantic import ValidationError
+
+from agents import agent1_researcher
 from core.config import settings
 from core.logger import get_logger
-from core.models import JobState
+from core.models import JobState, ScriptPayload, new_job_id, validate_job_id
+from core.niche import load_niche
 
 logger = get_logger("orchestrator")
 
-# Ordered pipeline definition: (display_name, agent_module.run)
-_PIPELINE = [
-    ("Agent 1 - Researcher & Writer  [claude-sonnet-4-5]", agent1_researcher.run),
-    ("Agent 2 - Media Synthesizer    [gemini-2.5-flash]",  agent2_media.run),
-    ("Agent 3 - Editor               [gemini-2.5-flash]",  agent3_editor.run),
-    ("Agent 4 - Publisher            [gemini-2.5-flash]",  agent4_publisher.run),
-]
 
-
-def run_pipeline(topic: str, job_id: str | None = None) -> JobState:
+def run_script(
+    topic: str,
+    niche_path: str | Path,
+    job_id: str | None = None,
+    client: object | None = None,
+) -> JobState:
     """
-    Run the full four-agent pipeline synchronously.
+    Generate one unapproved script and return.
 
-    Args:
-        topic:  The niche topic string to generate a Reel about.
-        job_id: Optional deterministic ID; one is generated if omitted.
-
-    Returns:
-        The final JobState with all fields populated.
+    Media, render, and publish are not imported and not called.
     """
-    if not job_id:
-        job_id = str(uuid.uuid4())[:8]
+    cleaned_topic = topic.strip()
+    if not cleaned_topic:
+        raise ValueError("topic is required")
 
-    # Ensure top-level output directory exists
-    output_dir: Path = settings.output_dir / job_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_job_id = new_job_id() if job_id is None else job_id
+    validate_job_id(resolved_job_id)
+    niche = load_niche(niche_path)
 
     logger.info(
-        "Pipeline starting",
-        extra={"job_id": job_id, "topic": topic, "agents": len(_PIPELINE)},
+        "Script run starting",
+        extra={"job_id": resolved_job_id, "topic": cleaned_topic, "niche": niche.name},
     )
-
-    state = JobState(job_id=job_id, topic=topic)
-
-    for step_num, (name, agent_fn) in enumerate(_PIPELINE, start=1):
-        logger.info(f"[{step_num}/{len(_PIPELINE)}] Starting {name}", extra={"job_id": job_id})
-        try:
-            state = agent_fn(state)
-        except Exception as exc:
-            logger.error(
-                f"[{step_num}/{len(_PIPELINE)}] {name} FAILED",
-                extra={"job_id": job_id, "error": str(exc)},
-                exc_info=True,
-            )
-            raise RuntimeError(f"{name} failed: {exc}") from exc
-        logger.info(f"[{step_num}/{len(_PIPELINE)}] Completed {name}", extra={"job_id": job_id})
-
+    state = JobState(job_id=resolved_job_id, topic=cleaned_topic, niche=niche)
+    state = agent1_researcher.run(state, client=client)
     logger.info(
-        "Pipeline complete",
-        extra={
-            "job_id": job_id,
-            "post_id": state.instagram_post_id,
-            "gcs_url": state.gcs_public_url,
-        },
+        "Script run finished",
+        extra={"job_id": resolved_job_id, "approved": False},
     )
     return state
 
 
-if __name__ == "__main__":
+def run_dry(
+    job_id: str,
+    *,
+    synthesize=None,
+    fetch_video=None,
+    run_ffmpeg=None,
+    encoder: str | None = None,
+    fontfile: Path | None = None,
+) -> JobState:
+    """
+    Render an approved job. Refuse when approved is false.
+
+    The publisher module is not imported.
+    """
+    validated = validate_job_id(job_id)
+    script = _load_job_script(validated)
+    if script.approved is not True:
+        raise ValueError(
+            f"Refusing to render job {validated}: approved is false in script.json. "
+            "Set approved to true after review, then re-run --dry-run. "
+            "Nothing was uploaded or published."
+        )
+
+    from agents import agent2_media, agent3_editor
+
+    logger.info("Dry run starting", extra={"job_id": validated})
+    state = JobState(job_id=validated, topic=script.topic, script=script)
+    state = agent2_media.run(state, synthesize=synthesize, fetch_video=fetch_video)
+    state = agent3_editor.run(
+        state,
+        run_ffmpeg=run_ffmpeg,
+        encoder=encoder,
+        fontfile=fontfile,
+    )
+    logger.info(
+        "Dry run finished",
+        extra={"job_id": validated, "output": str(state.final_reel_path)},
+    )
+    return state
+
+
+def _load_job_script(job_id: str) -> ScriptPayload:
+    script_path = settings.output_dir / job_id / "script.json"
+    if not script_path.is_file():
+        raise FileNotFoundError(f"No script.json for job {job_id} under {settings.output_dir}")
+    return ScriptPayload.model_validate_json(script_path.read_text(encoding="utf-8"))
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Faceless Instagram Reels Pipeline",
+        description="Write an unapproved Reel script, or render an approved one.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "--topic",
-        required=True,
-        help="Niche topic for the educational reel.\nExample: '5 fascinating facts about black holes'",
+        default=None,
+        help="Topic for the reel.\nExample: 'Why is the sky blue?'",
+    )
+    parser.add_argument(
+        "--niche",
+        default=None,
+        help="Path to a niche JSON profile.\nExample: niches/example.json",
     )
     parser.add_argument(
         "--job-id",
         default=None,
         metavar="ID",
-        help="Optional job identifier (auto-generated if omitted).",
+        help="Job id matching ^[a-z0-9-]{1,32}$.\nRequired with --dry-run unless the id is passed as --dry-run ID.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dry-run",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="JOB_ID",
+        help=(
+            "Render an existing approved script and stop.\n"
+            "Examples:\n"
+            "  python main.py --dry-run --job-id sleep-001\n"
+            "  python main.py --dry-run sleep-001"
+        ),
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Refused. Later: the only Meta call, and only if approved.",
+    )
+    args = parser.parse_args(argv)
 
-    final_state = run_pipeline(topic=args.topic, job_id=args.job_id)
+    if args.publish:
+        parser.error(
+            "--publish is not implemented. It will be the only Meta call, "
+            "and only when approved is true."
+        )
+
+    try:
+        if args.dry_run:
+            job_id = _dry_run_job_id(args.dry_run, args.job_id)
+            state = run_dry(job_id)
+            print(f"\n{'=' * 60}")
+            print("  Rendered. Not published.")
+            print(f"  Job ID       : {state.job_id}")
+            print(f"  Reel         : {state.final_reel_path}")
+            print("  Approved     : true")
+            print(f"{'=' * 60}\n")
+            return 0
+
+        if not args.topic or not args.niche:
+            parser.error("--topic and --niche are required to write a script.")
+        state = run_script(topic=args.topic, niche_path=args.niche, job_id=args.job_id)
+    except (ValueError, FileNotFoundError, ValidationError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    script_path = settings.output_dir / state.job_id / "script.json"
     print(f"\n{'=' * 60}")
-    print(f"  Pipeline finished!")
-    print(f"  Job ID          : {final_state.job_id}")
-    print(f"  Instagram Post  : {final_state.instagram_post_id}")
-    print(f"  GCS URL         : {final_state.gcs_public_url}")
-    print(f"  Local output    : {final_state.final_reel_path}")
+    print("  Script written. Not approved.")
+    print(f"  Job ID       : {state.job_id}")
+    print(f"  Niche        : {state.niche.name if state.niche else ''}")
+    print(f"  Script       : {script_path}")
+    print("  Approved     : false")
     print(f"{'=' * 60}\n")
+    return 0
+
+
+def _dry_run_job_id(dry_run: str | bool, job_id: str | None) -> str:
+    if isinstance(dry_run, str):
+        if job_id and job_id != dry_run:
+            raise ValueError("--dry-run job id and --job-id disagree")
+        return dry_run
+    if not job_id:
+        raise ValueError(
+            "--dry-run needs a job id. Use --dry-run JOB_ID or --dry-run --job-id JOB_ID."
+        )
+    return job_id
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
