@@ -234,7 +234,6 @@ class JobState(BaseModel):
     background_path: Optional[Path] = None
     caption_cues: list[CaptionCue] = Field(default_factory=list)
     final_reel_path: Optional[Path] = None
-    gcs_public_url: Optional[str] = None
     instagram_post_id: Optional[str] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

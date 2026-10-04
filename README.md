@@ -3,11 +3,13 @@
 A topic-in engine for faceless Instagram Reels. A niche is a JSON profile
 passed in with the topic. The default command writes an unapproved script
 and stops. `--dry-run` renders only after a person sets `approved` to true.
-It does not upload or publish.
+`--publish` posts only when that person passes `--confirm-publish` as well.
+Nothing is queued, scheduled, or posted unattended.
 
 ```
 Topic + niche JSON --► one Gemini Flash call --► script.json (approved: false)
 approved script.json --► Kokoro-82M + Pexels + ffmpeg --► final_reel.mp4
+approved script + final_reel.mp4 --► --publish (preview) --► --confirm-publish
 ```
 
 | Stage | Role | When it runs |
@@ -15,7 +17,7 @@ approved script.json --► Kokoro-82M + Pexels + ffmpeg --► final_reel.mp4
 | Script | One Gemini Flash call | `python main.py --topic ... --niche ...` |
 | Voice + picture | Local Kokoro-82M and Pexels | `--dry-run`, and only if `approved` is true |
 | Render | ffmpeg, 1080x1920 H.264/AAC | same `--dry-run` |
-| Publish | Meta | Not implemented. `--publish` is refused. |
+| Publish | Plain Python, Meta Graph API | `--publish`, and only with `--confirm-publish` after approval |
 
 ---
 
@@ -52,7 +54,7 @@ python main.py --topic "Why is the sky blue?" --niche niches/example.json
 python main.py --topic "The science of sleep" --niche niches/example.json --job-id sleep-001
 ```
 
-Only `GEMINI_API_KEY` is required for that command. `--publish` is refused.
+Only `GEMINI_API_KEY` is required for that command. It does not publish.
 
 ### 4b. Render an approved script
 
@@ -71,6 +73,31 @@ Kokoro writes `audio.wav` and `timings.json`. ffmpeg burns `on_screen_hook`
 for the first 3 seconds and narration captions from those timings.
 `h264_nvenc` is used only if a one-frame test encode succeeds; otherwise
 `libx264`. Nothing is uploaded.
+
+### 4c. Publish, supervised
+
+Publishing is a separate command. It does not run as part of the script
+command, `--dry-run`, or the webhook.
+
+```bash
+# Preview only. Prints the caption and the video path. No network call.
+python main.py --publish --job-id sleep-001
+
+# The only Meta call. Refuses unless approved is true and final_reel.mp4 exists.
+python main.py --publish --job-id sleep-001 --confirm-publish
+```
+
+`--confirm-publish` reads `INSTAGRAM_ACCESS_TOKEN` and `INSTAGRAM_ACCOUNT_ID`
+from the environment. It checks the live content-publishing quota, uploads
+the local mp4 with a resumable upload (the file is not given a public URL),
+waits until the container is `FINISHED`, then publishes once. The result is
+`output/<job_id>/publish.json`. If that file already has a `post_id`, the
+command refuses and does not post again.
+
+The caption sent to Meta is `script.caption`, then a blank line, then
+`script.hashtags` that are not already in the body. The script stage stores
+the caption body without hashtags. `share_to_feed` is true, and
+`is_ai_generated` is true.
 
 ### 5. Start the webhook server
 
@@ -99,14 +126,15 @@ curl -X POST http://localhost:8080/run \
 >   Default 512 MiB / 1 GiB will SIGKILL the container (exit code 137).
 >   **Minimum: `--memory 4Gi`**
 >
-> - **Timeout**: The Meta polling loop alone allows up to 6 minutes, plus TTS
->   and ffmpeg time. Default 5-minute HTTP timeout causes a 504 mid-pipeline.
->   **Minimum: `--timeout 900` (15 minutes)**
+> - **Timeout**: `/run` and `/run-async` only write a script. They do not
+>   render, poll Meta, or publish, so they do not need a long request timeout
+>   for a publish loop.
 >
-> - **Production trigger**: Always use `/run-async` or Cloud Tasks (see below).
->   Never trigger `/run` synchronously from Cloud Scheduler at scale.
+> There is no Cloud Scheduler job, Cloud Tasks queue, or Cloud Run job for
+> posting. Publishing is the supervised `--publish --confirm-publish` command
+> only. Do not point a scheduler at this service to post Reels.
 >
-> Pass 1: both `/run` and `/run-async` only write an unapproved script.
+> Both `/run` and `/run-async` only write an unapproved script.
 > They do not render, and they do not publish.
 
 ### 1. Build and push the container
@@ -121,88 +149,41 @@ gcloud builds submit --tag $IMAGE
 ### 2. Create Secret Manager secrets
 
 ```bash
-for SECRET in GEMINI_API_KEY GOOGLE_API_KEY INSTAGRAM_ACCESS_TOKEN \
-              INSTAGRAM_ACCOUNT_ID PEXELS_API_KEY; do
+for SECRET in GEMINI_API_KEY PEXELS_API_KEY; do
   gcloud secrets create $SECRET --replication-policy="automatic"
 done
 
 # Populate each secret with your own values. Never commit them.
 echo -n "your-gemini-api-key" | gcloud secrets versions add GEMINI_API_KEY --data-file=-
-# Repeat for all others...
+# Repeat for PEXELS_API_KEY.
 ```
 
-### 3. Grant IAM roles for Workload Identity + Signed URL signing
+The Instagram token is not a webhook secret. Put it in the environment of
+the shell where you run `--confirm-publish`.
 
-The Cloud Run service account needs these roles to generate V4 Signed URLs
-without a service-account key file:
+### 3. Deploy to Cloud Run
+
+The webhook does not publish and does not need an Instagram token or a GCS
+bucket. Run `--publish` where you can watch it, with the token in that
+environment, not on a scheduled service.
 
 ```bash
-PROJECT_ID=your-gcp-project-id
 SA_EMAIL=your-cloudrun-sa@$PROJECT_ID.iam.gserviceaccount.com
 
-# Allow GCS access for a later publish pass. Voice is local Kokoro, not Cloud TTS.
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:$SA_EMAIL" \
-  --role="roles/storage.admin"
-
-# Allow the SA to sign blobs (needed for V4 Signed URLs on Cloud Run)
-# The SA grants this role TO ITSELF - this is the standard pattern.
-gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
-  --member="serviceAccount:$SA_EMAIL" \
-  --role="roles/iam.serviceAccountTokenCreator"
-```
-
-### 4. Deploy to Cloud Run
-
-```bash
 gcloud run deploy faceless-reels-pipeline \
   --image $IMAGE \
   --region us-central1 \
   --platform managed \
   --memory 4Gi \
   --cpu 2 \
-  --timeout 900 \
+  --timeout 300 \
   --concurrency 1 \
   --service-account $SA_EMAIL \
-  --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest,\
-GOOGLE_API_KEY=GOOGLE_API_KEY:latest,\
-INSTAGRAM_ACCESS_TOKEN=INSTAGRAM_ACCESS_TOKEN:latest,\
-INSTAGRAM_ACCOUNT_ID=INSTAGRAM_ACCOUNT_ID:latest,\
-PEXELS_API_KEY=PEXELS_API_KEY:latest" \
-  --set-env-vars "GCS_BUCKET_NAME=faceless-reels-public-assets,GCS_REGION=US"
+  --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest,PEXELS_API_KEY=PEXELS_API_KEY:latest"
 ```
 
-### 5. Production trigger: Cloud Tasks (recommended) or Cloud Scheduler
-
-**Option A — Cloud Tasks (best for reliability)**
-
-Use Cloud Tasks to enqueue jobs. Each task calls `/run-async` so the HTTP
-response is immediate and Cloud Run is not held open for 10+ minutes:
-
-```bash
-gcloud tasks queues create reels-queue --location us-central1
-
-# Enqueue a job
-gcloud tasks create-http-task \
-  --queue reels-queue \
-  --location us-central1 \
-  --url "https://<your-cloud-run-url>/run-async" \
-  --method POST \
-  --header "Content-Type:application/json" \
-  --body '{"topic":"Why is the sky blue?"}'
-```
-
-**Option B — Cloud Scheduler (simple cron)**
-
-```bash
-gcloud scheduler jobs create http faceless-reels-daily \
-  --location us-central1 \
-  --schedule "0 9 * * *" \
-  --uri "https://<your-cloud-run-url>/run-async" \
-  --message-body '{"topic": "daily science fact"}' \
-  --headers "Content-Type=application/json" \
-  --time-zone "America/New_York"
-```
+Posting is not part of this deployment. Do not add Cloud Scheduler, Cloud
+Tasks, or a Cloud Run job that calls `--publish`.
 
 ---
 
@@ -220,13 +201,15 @@ output/
     background.mp4       # Pexels clip (--dry-run)
     captions.ass         # burned-in narration cues (--dry-run)
     final_reel.mp4       # 1080x1920 H.264/AAC (--dry-run)
+    publish.json         # container_id, post_id, timestamps (--confirm-publish)
 ```
 
 `OUTPUT_DIR` overrides the directory. The container sets it to `/tmp/output`
-so the non-root user can write it.
+so the non-root user can write it. The publish command reads
+`$OUTPUT_DIR/<job_id>/script.json` and `$OUTPUT_DIR/<job_id>/final_reel.mp4`.
 
-On Cloud Run, `output/` is ephemeral. The reel is uploaded to GCS before
-the container terminates; local files are discarded.
+On Cloud Run, `output/` is ephemeral. The webhook does not upload that
+directory anywhere.
 
 ---
 
@@ -299,44 +282,56 @@ python -m pytest tests
 
 ## Instagram Access Token
 
-> **IMPORTANT: Use a System User token, not a standard user token.**
+`--confirm-publish` sends the token as `Authorization: Bearer` on Graph API
+calls and as `Authorization: OAuth` on `rupload.facebook.com`. It never
+prints the token.
 
-Standard long-lived user access tokens expire after **60 days**. A static token
-stored in Secret Manager will silently fail after two months.
+Resumable upload is documented for apps that use **Facebook Login for
+Business**, on `graph.facebook.com`. An Instagram Login token
+(`graph.instagram.com`) is a different host and is not what this command
+calls.
 
-**Fix: generate a non-expiring token via a Business Manager System User.**
+The content-publishing reference asks for a Facebook user access token with:
 
-1. Open [Meta Business Manager](https://business.facebook.com) → Settings → Users → System Users
-2. Create a System User (Admin role)
-3. Assign your Instagram Professional Account to the System User
-4. Generate a token with scopes:
-   - `instagram_basic`
-   - `instagram_content_publish`
-   - `pages_read_engagement`
-5. Set expiry to **Never** (only available for System User tokens)
-6. Store the token in Secret Manager as `INSTAGRAM_ACCESS_TOKEN`
+- `instagram_basic`
+- `instagram_content_publish`
+- `pages_read_engagement`
 
-System User tokens do not expire and survive password changes, account
-deactivations, and two-factor re-authentication on the human account.
+A standard long-lived user token expires after about 60 days. A Business
+Manager system user can mint a non-expiring token with those permissions.
+Whether a system-user token satisfies the current "Facebook Login for
+Business" resumable-upload requirement depends on the app's login setup.
+If Meta rejects the token, the command prints the Graph `error` object
+(`message`, `type`, `code`, `error_subcode`, `fbtrace_id`).
+
+Set the token only in the environment where you run `--confirm-publish`.
+Do not commit it.
 
 ---
 
-## GCS Bucket & Signed URL Security
+## Publish sequence
 
-The pipeline uses **V4 Signed URLs** (30-minute TTL) rather than making objects
-or the bucket publicly accessible. This means:
+With `--confirm-publish`, and only after the local gates pass, the calls are:
 
-- The bucket `faceless-reels-public-assets` remains **fully private**
-- Meta's servers fetch the video via the time-limited URL
-- After 30 minutes the URL is invalid; the video is safe in GCS
-- No object ACLs are modified; the approach is UBLA-compatible by design
+1. `GET /{ig-user-id}/content_publishing_limit?fields=quota_usage,config`
+   Stop when `quota_usage + 1 >= quota_total`. `quota_total` is taken from
+   the response and is never hardcoded.
+2. `POST /{ig-user-id}/media` with `media_type=REELS`, `upload_type=resumable`,
+   `caption`, `share_to_feed=true`, `is_ai_generated=true`.
+3. `POST` the local mp4 to the returned `uri` (`rupload.facebook.com`) with
+   `Authorization: OAuth`, `offset: 0`, and `file_size`.
+4. `GET /{container-id}?fields=status_code,status` about every
+   `PUBLISH_POLL_INTERVAL_SECONDS` (default 60) until `FINISHED`, `ERROR`,
+   `EXPIRED`, or `PUBLISH_MAX_WAIT_SECONDS` (default 600). `ERROR` and
+   `EXPIRED` fail with the `status` text.
+5. `POST /{ig-user-id}/media_publish` with `creation_id`.
+
+Graph API version defaults to `v26.0` (`GRAPH_API_VERSION`).
 
 ---
 
 ## Security Notes
 
 - **Never commit `.env`** or service-account JSON keys to version control.
-- On Cloud Run, use **Workload Identity** (no key files). Leave
-  `GOOGLE_APPLICATION_CREDENTIALS` empty and grant IAM roles to the SA directly.
-- The pipeline does NOT disable UBLA on the GCS bucket. Signed URLs work
-  regardless of bucket-level access settings.
+- The publish path does not upload the reel to GCS and does not create a
+  public URL. The video bytes go to Meta's resumable upload endpoint.

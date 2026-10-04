@@ -240,10 +240,13 @@ def test_run_endpoints_do_not_import_or_call_render_or_publish(tmp_path: Path, m
         assert name not in sys.modules
 
     source = inspect.getsource(server)
-    main_source = inspect.getsource(sys.modules["main"])
+    main_mod = sys.modules["main"]
+    main_source = inspect.getsource(main_mod)
     for forbidden in ("BackgroundTasks", "agent2_media", "agent3_editor", "agent4_publisher"):
         assert forbidden not in source
-    assert "agent4_publisher" not in main_source
+    # Script and dry-run stay free of the publisher. --publish imports it lazily.
+    assert "agent4_publisher" not in inspect.getsource(main_mod.run_script)
+    assert "agent4_publisher" not in inspect.getsource(main_mod.run_dry)
     assert "BackgroundTasks" not in main_source
 
     fake = FakeClient()
@@ -284,7 +287,7 @@ def test_run_endpoints_do_not_import_or_call_render_or_publish(tmp_path: Path, m
         assert name not in sys.modules
 
 
-def test_cli_refuses_publish():
+def test_cli_publish_requires_job_id():
     result = subprocess.run(
         [sys.executable, "main.py", "--topic", "sky", "--niche", str(NICHE), "--publish"],
         cwd=ROOT,
@@ -293,4 +296,4 @@ def test_cli_refuses_publish():
         check=False,
     )
     assert result.returncode != 0
-    assert "not implemented" in result.stderr.lower()
+    assert "job-id" in result.stderr.lower()

@@ -15,7 +15,13 @@ Dry run (render only an already approved script):
     Loads output/<job_id>/script.json. Renders only when approved is true.
     Does not upload or publish.
 
---publish is refused. It is reserved for a later pass.
+Publish (supervised, after a reviewed render):
+    python main.py --publish --job-id sleep-001
+    python main.py --publish --job-id sleep-001 --confirm-publish
+
+    Without --confirm-publish, print the caption and final_reel.mp4 path
+    and exit. No network call. --confirm-publish is the only Meta call,
+    and only when approved is true.
 """
 import argparse
 import sys
@@ -114,7 +120,7 @@ def _load_job_script(job_id: str) -> ScriptPayload:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Write an unapproved Reel script, or render an approved one.",
+        description="Write an unapproved Reel script, render an approved one, or publish it.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -149,15 +155,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--publish",
         action="store_true",
-        help="Refused. Later: the only Meta call, and only if approved.",
+        help=(
+            "Load an existing job and preview the Reel caption and video path.\n"
+            "Posts only when --confirm-publish is also set and approved is true.\n"
+            "Example: python main.py --publish --job-id sleep-001 --confirm-publish"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-publish",
+        action="store_true",
+        help="With --publish, post the approved Reel. Without it, --publish only previews.",
     )
     args = parser.parse_args(argv)
 
+    if args.confirm_publish and not args.publish:
+        parser.error("--confirm-publish requires --publish.")
+    if args.publish and args.dry_run:
+        parser.error("Use either --dry-run or --publish, not both.")
     if args.publish:
-        parser.error(
-            "--publish is not implemented. It will be the only Meta call, "
-            "and only when approved is true."
-        )
+        if not args.job_id:
+            parser.error("--publish requires --job-id.")
+        try:
+            run_publish(args.job_id, confirm=bool(args.confirm_publish))
+        except (ValueError, FileNotFoundError, ValidationError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return 0
 
     try:
         if args.dry_run:
@@ -187,6 +210,27 @@ def main(argv: list[str] | None = None) -> int:
     print("  Approved     : false")
     print(f"{'=' * 60}\n")
     return 0
+
+
+def run_publish(job_id: str, *, confirm: bool) -> None:
+    """
+    Preview or post one rendered job.
+
+    The publisher is imported here so the script command, --dry-run, and the
+    webhook do not load it.
+    """
+    from agents.agent4_publisher import publish
+
+    result = publish(job_id, confirm=confirm)
+    if result is None:
+        return
+    print(f"\n{'=' * 60}")
+    print("  Published.")
+    print(f"  Job ID       : {validate_job_id(job_id)}")
+    print(f"  Container ID : {result['container_id']}")
+    print(f"  Post ID      : {result['post_id']}")
+    print(f"  Record       : {settings.output_dir / job_id / 'publish.json'}")
+    print(f"{'=' * 60}\n")
 
 
 def _dry_run_job_id(dry_run: str | bool, job_id: str | None) -> str:
