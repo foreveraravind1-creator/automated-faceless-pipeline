@@ -1,241 +1,490 @@
 ﻿"""
 agents/agent4_publisher.py
-Agent 4 - Publisher
-APIs : Google Cloud Storage (V4 Signed URL), Meta Graph API v20.0
+Supervised Instagram Reel publish. Plain Python. No model call.
 
-The Instagram caption is script.caption. This module does not call a model.
-Nothing in the script or dry-run commands imports or calls it.
+Graph API version comes from settings (default v26.0). Host is
+graph.facebook.com, which is the Facebook Login for Business host.
+Resumable upload is documented only for that login type.
 
-GCS strategy: V4 Signed URL (30-minute TTL)
-  - Works under Uniform Bucket-Level Access (UBLA) - no object ACLs needed.
-  - Local dev  : GOOGLE_APPLICATION_CREDENTIALS -> service-account key JSON
-                 (key's private key signs directly).
-  - Cloud Run  : Workload Identity -> metadata server provides SA email + token;
-                 generate_signed_url calls IAM SignBlob API automatically.
-                 Requirement: Cloud Run SA needs roles/iam.serviceAccountTokenCreator
-                 granted on itself (see README.md).
+Caption convention
+    The script stage stores ``caption`` as the body without hashtags and
+    keeps tags in ``hashtags``. The published caption is that body, then a
+    blank line, then the hashtags that are not already in the body. The
+    previous publisher sent ``script.caption`` alone; this pass appends the
+    stored tags so the Reel matches the split the script stage already writes.
 
-Input  : JobState.final_reel_path, JobState.script
-Output : JobState.gcs_public_url (signed URL), JobState.instagram_post_id
+Nothing here is public. The video is posted to the resumable ``uri`` Meta
+returns. There is no GCS upload and no public URL.
+
+This module is not imported by the webhook. ``main.py`` imports it only
+when ``--publish`` runs.
 """
-import datetime
-import time
-import urllib.request
-from pathlib import Path
+from __future__ import annotations
 
-import google.auth
-import google.auth.transport.requests
+import json
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
 import httpx
-from google.api_core import exceptions as gcp_exceptions
-from google.cloud import storage
 
 from core.config import settings
 from core.logger import get_logger
-from core.models import JobState
+from core.models import ScriptPayload, validate_job_id
 
 logger = get_logger(__name__)
 
-META_BASE = "https://graph.facebook.com/v20.0"
-SIGNED_URL_TTL_MINUTES = 30  # Meta fetches the video within seconds; 30 min is ample
+GRAPH_HOST = "https://graph.facebook.com"
+RUPLOAD_PREFIX = "https://rupload.facebook.com/"
+CAPTION_LIMIT = 2200
+_TERMINAL_FAILURES = frozenset({"ERROR", "EXPIRED"})
 
 
-# ---------------------------------------------------------------------------
-# GCS helpers - V4 Signed URL (UBLA-compatible)
-# ---------------------------------------------------------------------------
-
-def _get_sa_email_from_metadata() -> str:
-    """Fetch the default service account email from the GCE metadata server."""
-    url = (
-        "http://metadata.google.internal/computeMetadata/v1"
-        "/instance/service-accounts/default/email"
-    )
-    req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return resp.read().decode("utf-8")
+class PublishRefused(RuntimeError):
+    """A local gate or Meta response stopped the publish. Nothing to retry blindly."""
 
 
-def _upload_to_gcs_signed(file_path: Path) -> str:
+def compose_caption(script: ScriptPayload) -> str:
+    """Join script.caption with hashtags that are not already in the body."""
+    body = script.caption.strip()
+    present = {tag.lower() for tag in re.findall(r"#[A-Za-z0-9_]+", body)}
+    extra = [tag for tag in script.hashtags if tag.lower() not in present]
+    caption = body if not extra else f"{body}\n\n{' '.join(extra)}"
+    if len(caption) > CAPTION_LIMIT:
+        raise PublishRefused(
+            f"Refusing to publish: caption is {len(caption)} characters "
+            f"and Instagram allows {CAPTION_LIMIT}."
+        )
+    return caption
+
+
+def publish(
+    job_id: str,
+    *,
+    confirm: bool,
+    client: httpx.Client | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] | None = None,
+) -> dict[str, Any] | None:
     """
-    Upload the final reel to GCS.
-    Returns a V4 Signed URL valid for SIGNED_URL_TTL_MINUTES minutes.
+    Load one job and either preview it or post it.
 
-    This approach is UBLA-compatible because it uses signed URLs rather than
-    object-level ACLs. The bucket can remain fully private; Meta's servers
-    download the video via the time-limited signed URL.
+    Without confirm, print the caption and the video path and return None.
+    No HTTP client is used on that path. With confirm, post once and return
+    the publish.json object. A second call is refused when that file already
+    has a post_id.
     """
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    auth_request = google.auth.transport.requests.Request()
-    credentials.refresh(auth_request)
+    validated = validate_job_id(job_id)
+    script = _load_script(validated)
+    if script.approved is not True:
+        raise PublishRefused(
+            f"Refusing to publish job {validated}: approved is false in script.json. "
+            "Set approved to true after review. Nothing was uploaded or published."
+        )
 
-    gcs = storage.Client(credentials=credentials)
-    bucket_name = settings.gcs_bucket_name
+    reel_path = _reel_path(validated)
+    if not reel_path.is_file():
+        raise PublishRefused(
+            f"Refusing to publish job {validated}: final_reel.mp4 is missing "
+            f"at {reel_path}. Render with --dry-run first. Nothing was published."
+        )
 
+    existing = _existing_post_id(validated)
+    if existing:
+        raise PublishRefused(
+            f"Refusing to publish job {validated}: publish.json already has "
+            f"post_id {existing}. This job is one-shot and was not posted again."
+        )
+
+    caption = compose_caption(script)
+    if not confirm:
+        print("Caption:")
+        print(caption)
+        print()
+        print("Video:")
+        print(reel_path)
+        print()
+        print("Not published. No request was sent. Re-run with --publish --confirm-publish to post.")
+        return None
+
+    if reel_path.stat().st_size <= 0:
+        raise PublishRefused(
+            f"Refusing to publish job {validated}: final_reel.mp4 at {reel_path} is empty. "
+            "Nothing was published."
+        )
+
+    _require_credentials()
+    clock = now or (lambda: datetime.now(timezone.utc))
+    owns_client = client is None
+    http = client or httpx.Client(timeout=httpx.Timeout(60.0, read=300.0))
     try:
-        bucket = gcs.get_bucket(bucket_name)
-    except gcp_exceptions.NotFound:
-        # Create bucket - UBLA is on by default; we do NOT disable it
-        bucket = gcs.create_bucket(bucket_name, location=settings.gcs_region)
-        logger.info("GCS bucket created", extra={"bucket": bucket_name})
+        return _post(validated, caption, reel_path, http, sleep, clock)
+    finally:
+        if owns_client:
+            http.close()
 
-    blob_name = f"reels/{file_path.stem}_{int(time.time())}{file_path.suffix}"
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(str(file_path), content_type="video/mp4")
-    logger.info("File uploaded to GCS", extra={"blob": blob_name})
 
-    expiration = datetime.timedelta(minutes=SIGNED_URL_TTL_MINUTES)
+def _post(
+    job_id: str,
+    caption: str,
+    reel_path: Path,
+    client: httpx.Client,
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+) -> dict[str, Any]:
+    version = settings.graph_api_version
+    ig_user_id = settings.instagram_account_id.strip()
+    token = settings.instagram_access_token
+    base = f"{GRAPH_HOST}/{version}"
+    stamps: dict[str, str] = {}
 
-    # Service account key credentials (signer available) - sign directly
-    if hasattr(credentials, "_signer") or hasattr(credentials, "signer"):
-        signed_url = blob.generate_signed_url(
-            expiration=expiration,
-            method="GET",
-            version="v4",
-        )
-    else:
-        # Compute Engine / Workload Identity: use IAM SignBlob via access token
-        try:
-            sa_email = _get_sa_email_from_metadata()
-        except Exception:
-            # Fallback: google.auth may expose it directly on some credential types
-            sa_email = getattr(credentials, "service_account_email", None)
-            if not sa_email:
-                raise RuntimeError(
-                    "Cannot determine service account email for signing. "
-                    "Set GOOGLE_APPLICATION_CREDENTIALS or use Workload Identity."
-                )
-
-        signed_url = blob.generate_signed_url(
-            expiration=expiration,
-            method="GET",
-            version="v4",
-            service_account_email=sa_email,
-            access_token=credentials.token,
+    usage, total = _read_quota(client, base, ig_user_id, token)
+    stamps["quota_checked_at"] = _stamp(now)
+    if usage + 1 >= total:
+        raise PublishRefused(
+            "Refusing to publish: the next post would hit or exceed the "
+            f"content publishing quota (quota_usage={usage}, quota_total={total}). "
+            "No container was created."
         )
 
+    container_id, upload_uri = _create_container(
+        client, base, ig_user_id, token, caption
+    )
+    stamps["container_created_at"] = _stamp(now)
+    _upload_reel(client, upload_uri, token, reel_path)
+    stamps["uploaded_at"] = _stamp(now)
+    _wait_until_finished(client, base, container_id, token, sleep)
+    stamps["container_finished_at"] = _stamp(now)
+    post_id = _publish_container(client, base, ig_user_id, token, container_id)
+    stamps["published_at"] = _stamp(now)
+
+    record = {
+        "container_id": container_id,
+        "post_id": post_id,
+        "timestamps": stamps,
+    }
+    try:
+        _write_record(job_id, record)
+    except OSError as exc:
+        raise PublishRefused(
+            f"Meta published post_id {post_id} (container_id {container_id}) but "
+            f"publish.json could not be written ({exc}). Do not confirm again until "
+            "that post_id is recorded in publish.json."
+        ) from exc
     logger.info(
-        "V4 Signed URL generated",
-        extra={"ttl_min": SIGNED_URL_TTL_MINUTES, "blob": blob_name},
+        "Reel published",
+        extra={"job_id": job_id, "container_id": container_id, "post_id": post_id},
     )
-    return signed_url
+    return record
 
 
-# ---------------------------------------------------------------------------
-# Meta Graph API helpers (3-step Reels publish flow)
-# ---------------------------------------------------------------------------
-
-def _create_reels_container(video_url: str, caption: str) -> str:
-    """
-    Step 1/3: POST /{ig-user-id}/media
-    Creates an upload container; returns the container ID.
-    """
-    endpoint = f"{META_BASE}/{settings.instagram_account_id}/media"
-    payload = {
-        "media_type": "REELS",
-        "video_url": video_url,
-        "caption": caption,
-        "share_to_feed": "true",
-        "access_token": settings.instagram_access_token,
-    }
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(endpoint, data=payload)
-        resp.raise_for_status()
-
-    container_id = resp.json()["id"]
-    logger.info("Reels container created", extra={"container_id": container_id})
-    return container_id
+def _load_script(job_id: str) -> ScriptPayload:
+    script_path = settings.output_dir / job_id / "script.json"
+    if not script_path.is_file():
+        raise FileNotFoundError(
+            f"No script.json for job {job_id} under {settings.output_dir}"
+        )
+    return ScriptPayload.model_validate_json(script_path.read_text(encoding="utf-8"))
 
 
-def _poll_container_status(
-    container_id: str,
-    max_wait_s: int = 360,
-    poll_interval_s: int = 10,
-) -> None:
-    """
-    Step 2/3: GET /{container-id}?fields=status_code
-    Polls until status_code == FINISHED. Raises on ERROR / EXPIRED / timeout.
-    max_wait_s=360 requires Cloud Run --timeout >= 900 to avoid HTTP 504.
-    """
-    endpoint = f"{META_BASE}/{container_id}"
-    params = {
-        "fields": "status_code,status",
-        "access_token": settings.instagram_access_token,
-    }
-    elapsed = 0
-    with httpx.Client(timeout=30.0) as client:
-        while elapsed < max_wait_s:
-            resp = client.get(endpoint, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            status_code = data.get("status_code", "UNKNOWN")
-
-            logger.info(
-                "Container status poll",
-                extra={
-                    "container_id": container_id,
-                    "status_code": status_code,
-                    "elapsed_s": elapsed,
-                },
-            )
-
-            if status_code == "FINISHED":
-                return
-            if status_code in ("ERROR", "EXPIRED"):
-                raise RuntimeError(
-                    f"Instagram container failed. status_code={status_code} | "
-                    f"details={data.get('status')}"
-                )
-
-            time.sleep(poll_interval_s)
-            elapsed += poll_interval_s
-
-    raise TimeoutError(
-        f"Container {container_id} did not reach FINISHED within {max_wait_s}s."
-    )
+def _reel_path(job_id: str) -> Path:
+    return settings.output_dir / job_id / "final_reel.mp4"
 
 
-def _publish_reel(container_id: str) -> str:
-    """
-    Step 3/3: POST /{ig-user-id}/media_publish
-    Goes live and returns the published post ID.
-    """
-    endpoint = f"{META_BASE}/{settings.instagram_account_id}/media_publish"
-    payload = {
-        "creation_id": container_id,
-        "access_token": settings.instagram_access_token,
-    }
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(endpoint, data=payload)
-        resp.raise_for_status()
+def _record_path(job_id: str) -> Path:
+    return settings.output_dir / job_id / "publish.json"
 
-    post_id = resp.json()["id"]
-    logger.info("Reel published!", extra={"post_id": post_id})
+
+def _existing_post_id(job_id: str) -> str:
+    path = _record_path(job_id)
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PublishRefused(
+            f"Refusing to publish job {job_id}: publish.json is not valid JSON ({exc})."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PublishRefused(
+            f"Refusing to publish job {job_id}: publish.json is not an object."
+        )
+    post_id = str(payload.get("post_id") or "").strip()
     return post_id
 
 
-# ---------------------------------------------------------------------------
-# Agent entry-point
-# ---------------------------------------------------------------------------
+def _write_record(job_id: str, record: dict[str, Any]) -> None:
+    path = _record_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
-def run(state: JobState) -> JobState:
-    """Upload and publish using the caption already stored on the script."""
-    logger.info("Agent 4 starting", extra={"job_id": state.job_id})
-    if state.script is None:
-        raise ValueError("a script is required")
 
-    caption = state.script.caption
-    logger.info("Using script caption", extra={"length": len(caption)})
+def _require_credentials() -> None:
+    if not settings.instagram_access_token.strip():
+        raise PublishRefused(
+            "Refusing to publish: INSTAGRAM_ACCESS_TOKEN is not set. Nothing was posted."
+        )
+    if not settings.instagram_account_id.strip():
+        raise PublishRefused(
+            "Refusing to publish: INSTAGRAM_ACCOUNT_ID is not set. Nothing was posted."
+        )
+    if "/" in settings.instagram_account_id or settings.instagram_account_id.strip() != settings.instagram_account_id:
+        raise PublishRefused(
+            "Refusing to publish: INSTAGRAM_ACCOUNT_ID must be a single IG user id."
+        )
 
-    # Upload reel to GCS, get a 30-minute V4 Signed URL (UBLA-compatible)
-    signed_url = _upload_to_gcs_signed(state.final_reel_path)
-    state.gcs_public_url = signed_url
 
-    # Instagram 3-step Reels publish flow
-    container_id = _create_reels_container(signed_url, caption)
-    _poll_container_status(container_id)
-    post_id = _publish_reel(container_id)
+def _auth_headers(token: str, *, scheme: str) -> dict[str, str]:
+    return {"Authorization": f"{scheme} {token}"}
 
-    state.instagram_post_id = post_id
-    logger.info("Agent 4 complete", extra={"job_id": state.job_id, "post_id": post_id})
-    return state
+
+def _read_quota(
+    client: httpx.Client,
+    base: str,
+    ig_user_id: str,
+    token: str,
+) -> tuple[int, int]:
+    response = client.get(
+        f"{base}/{ig_user_id}/content_publishing_limit",
+        params={"fields": "quota_usage,config"},
+        headers=_auth_headers(token, scheme="Bearer"),
+    )
+    payload = _json_or_error(response, "content publishing limit")
+    return _parse_quota(payload)
+
+
+def _parse_quota(payload: Any) -> tuple[int, int]:
+    row: Any = None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list) and data:
+            row = data[0]
+        elif "quota_usage" in payload:
+            row = payload
+    if not isinstance(row, dict):
+        raise PublishRefused(
+            "Refusing to publish: content_publishing_limit did not return "
+            "quota_usage and config. No container was created."
+        )
+    config = row.get("config")
+    usage = row.get("quota_usage")
+    total = config.get("quota_total") if isinstance(config, dict) else None
+    if usage is None or total is None:
+        raise PublishRefused(
+            "Refusing to publish: content_publishing_limit omitted quota_usage "
+            "or config.quota_total. The limit is not assumed. No container was created."
+        )
+    try:
+        usage_n = int(usage)
+        total_n = int(total)
+    except (TypeError, ValueError) as exc:
+        raise PublishRefused(
+            "Refusing to publish: content_publishing_limit returned a non-numeric quota. "
+            "No container was created."
+        ) from exc
+    return usage_n, total_n
+
+
+def _create_container(
+    client: httpx.Client,
+    base: str,
+    ig_user_id: str,
+    token: str,
+    caption: str,
+) -> tuple[str, str]:
+    response = client.post(
+        f"{base}/{ig_user_id}/media",
+        headers={
+            **_auth_headers(token, scheme="Bearer"),
+            "Content-Type": "application/json",
+        },
+        json={
+            "media_type": "REELS",
+            "upload_type": "resumable",
+            "caption": caption,
+            "share_to_feed": True,
+            "is_ai_generated": True,
+        },
+    )
+    payload = _json_or_error(response, "create Reel container")
+    if not isinstance(payload, dict):
+        raise PublishRefused("Refusing to continue: Reel container response was not an object.")
+    container_id = str(payload.get("id") or "").strip()
+    uri = str(payload.get("uri") or "").strip()
+    if not container_id or not uri:
+        raise PublishRefused(
+            "Refusing to continue: Reel container response did not include id and uri."
+        )
+    if not uri.startswith(RUPLOAD_PREFIX):
+        raise PublishRefused(
+            "Refusing to continue: container uri is not on rupload.facebook.com. "
+            "The video was not uploaded."
+        )
+    return container_id, uri
+
+
+def _upload_reel(
+    client: httpx.Client,
+    uri: str,
+    token: str,
+    reel_path: Path,
+) -> None:
+    video = reel_path.read_bytes()
+    response = client.post(
+        uri,
+        headers={
+            "Authorization": f"OAuth {token}",
+            "offset": "0",
+            "file_size": str(len(video)),
+        },
+        content=video,
+    )
+    payload = _json_or_error(response, "rupload video")
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise PublishRefused(
+            "Refusing to continue: rupload did not report success. The Reel was not published. "
+            f"Response: {_public_body(payload)}"
+        )
+
+
+def _wait_until_finished(
+    client: httpx.Client,
+    base: str,
+    container_id: str,
+    token: str,
+    sleep: Callable[[float], None],
+) -> None:
+    interval = float(settings.publish_poll_interval_seconds)
+    max_wait = float(settings.publish_max_wait_seconds)
+    elapsed = 0.0
+    last_code = "UNKNOWN"
+    last_status: Any = None
+    while True:
+        response = client.get(
+            f"{base}/{container_id}",
+            params={"fields": "status_code,status"},
+            headers=_auth_headers(token, scheme="Bearer"),
+        )
+        payload = _json_or_error(response, "container status")
+        if not isinstance(payload, dict):
+            raise PublishRefused(
+                f"Instagram container {container_id} status response was not an object."
+            )
+        last_code = str(payload.get("status_code") or "UNKNOWN")
+        last_status = payload.get("status")
+        logger.info(
+            "Container status poll",
+            extra={
+                "container_id": container_id,
+                "status_code": last_code,
+                "elapsed_s": elapsed,
+            },
+        )
+        if last_code == "FINISHED":
+            return
+        if last_code in _TERMINAL_FAILURES:
+            detail = last_status if isinstance(last_status, str) and last_status.strip() else "(no status text)"
+            raise PublishRefused(
+                f"Instagram container {container_id} failed with status_code={last_code}: {detail}"
+            )
+        if elapsed + interval > max_wait:
+            raise PublishRefused(
+                f"Instagram container {container_id} was not FINISHED within {max_wait}s "
+                f"(last status_code={last_code}, status={last_status})."
+            )
+        sleep(interval)
+        elapsed += interval
+
+
+def _publish_container(
+    client: httpx.Client,
+    base: str,
+    ig_user_id: str,
+    token: str,
+    container_id: str,
+) -> str:
+    response = client.post(
+        f"{base}/{ig_user_id}/media_publish",
+        headers={
+            **_auth_headers(token, scheme="Bearer"),
+            "Content-Type": "application/json",
+        },
+        json={"creation_id": container_id},
+    )
+    payload = _json_or_error(response, "media_publish")
+    if not isinstance(payload, dict):
+        raise PublishRefused("media_publish response was not an object.")
+    post_id = str(payload.get("id") or "").strip()
+    if not post_id:
+        raise PublishRefused("media_publish response did not include an id. publish.json was not written.")
+    return post_id
+
+
+def _json_or_error(response: httpx.Response, action: str) -> Any:
+    body = _decode_body(response)
+    error = _error_object(body)
+    if response.status_code >= 400 or error:
+        raise PublishRefused(_format_graph_error(action, response.status_code, error, body))
+    return body
+
+
+def _decode_body(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        return None
+
+
+def _error_object(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        return {}
+    error = body.get("error")
+    if isinstance(error, dict):
+        return error
+    debug = body.get("debug_info")
+    if isinstance(debug, dict) and isinstance(debug.get("message"), str):
+        try:
+            nested = json.loads(debug["message"])
+        except json.JSONDecodeError:
+            nested = None
+        if isinstance(nested, dict) and isinstance(nested.get("error"), dict):
+            return nested["error"]
+    return {}
+
+
+def _format_graph_error(
+    action: str,
+    status_code: int,
+    error: dict[str, Any],
+    body: Any,
+) -> str:
+    if error:
+        return (
+            f"Meta API error during {action} (HTTP {status_code}): "
+            f"message={error.get('message')!r}; type={error.get('type')!r}; "
+            f"code={error.get('code')!r}; error_subcode={error.get('error_subcode')!r}; "
+            f"fbtrace_id={error.get('fbtrace_id')!r}"
+        )
+    return (
+        f"Meta API error during {action} (HTTP {status_code}): "
+        f"response had no error object. Body: {_public_body(body)}"
+    )
+
+
+def _public_body(body: Any) -> str:
+    try:
+        text = json.dumps(body, default=str)
+    except TypeError:
+        text = str(body)
+    return text[:500]
+
+
+def _stamp(now: Callable[[], datetime]) -> str:
+    moment = now()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.isoformat()

@@ -12,17 +12,8 @@ google-genai>=2.26.0               # Script stage: one Gemini Flash structured c
 kokoro>=0.9.4                      # Kokoro-82M TTS. Needs espeak-ng and Python <3.13.
 soundfile>=0.12.1                  # Write narration wav files
 
-# ── Google Cloud ─────────────────────────────────────────────
-google-cloud-storage>=2.18.0       # Later publish pass: GCS upload (not called yet)
-# google-auth is pinned explicitly because Agent 4 uses google.auth.default()
-# to detect credential type (service-account key vs Workload Identity) for
-# V4 Signed URL signing strategy selection.
-google-auth>=2.35.0
-google-auth-httplib2>=0.2.0        # Required by google-auth transport layer
-
 # ── HTTP client ──────────────────────────────────────────────
-httpx>=0.27.0                      # Pexels API + Meta Graph API
-requests>=2.31.0                   # google-auth transport (explicit pin)
+httpx>=0.27.0                      # Pexels API + Meta Graph API (mocked in tests)
 
 # ── Web framework ────────────────────────────────────────────
 fastapi>=0.115.0                   # Webhook server (/run, /run-async, /health)

@@ -2,11 +2,14 @@
 core/config.py
 Centralized settings - loaded once at import time from .env or the environment.
 
-The script stage requires only GEMINI_API_KEY. Meta, GCS, Google TTS, and
-Pexels settings stay optional so importing this module does not demand them.
+The script stage requires only GEMINI_API_KEY. Meta and Pexels settings stay
+optional so importing this module does not demand them. Publish reads the
+Meta settings only after --publish --confirm-publish.
 """
+import re
 from pathlib import Path
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,19 +26,20 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
 
-    # Optional until later passes. Agent 2/4 still read these when called.
+    # Unused by the script, render, and publish stages. Kept so older env
+    # files still load.
     google_api_key: str = ""
-    # Path to a GCP service-account JSON file (for TTS + GCS).
-    # On Cloud Run with Workload Identity, leave this as an empty string.
     google_application_credentials: str = ""
 
-    # Google Cloud Storage (later publish pass)
-    gcs_bucket_name: str = "faceless-reels-public-assets"
-    gcs_region: str = "US"
-
-    # Meta / Instagram (later publish pass)
+    # Meta / Instagram. Used only by --publish --confirm-publish.
+    # graph.facebook.com is the Facebook Login for Business host. Resumable
+    # Reel upload is documented for that login type, not Instagram Login.
     instagram_access_token: str = ""
     instagram_account_id: str = ""
+    graph_api_version: str = "v26.0"
+    # Status poll. Defaults match "about once a minute" with a bounded wait.
+    publish_poll_interval_seconds: float = 60
+    publish_max_wait_seconds: float = 600
 
     # Pexels stock video. Required only for --dry-run.
     pexels_api_key: str = ""
@@ -50,6 +54,24 @@ class Settings(BaseSettings):
 
     # Cloud Run / server
     port: int = 8080
+
+    @field_validator("graph_api_version")
+    @classmethod
+    def _graph_version(cls, value: str) -> str:
+        cleaned = value.strip()
+        if re.fullmatch(r"v\d+\.\d+", cleaned) is None:
+            raise ValueError("GRAPH_API_VERSION must look like v26.0")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _poll_bounds(self) -> "Settings":
+        if self.publish_poll_interval_seconds <= 0:
+            raise ValueError("PUBLISH_POLL_INTERVAL_SECONDS must be positive")
+        if self.publish_max_wait_seconds < self.publish_poll_interval_seconds:
+            raise ValueError(
+                "PUBLISH_MAX_WAIT_SECONDS must be at least PUBLISH_POLL_INTERVAL_SECONDS"
+            )
+        return self
 
 
 # Singleton - import this everywhere
